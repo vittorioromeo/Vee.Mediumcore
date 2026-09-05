@@ -10,6 +10,13 @@ the two can be developed and installed independently. It works fine alongside th
 
 **What it does**
 
+* Presets: *Mediumcore classic*, *Gentle*, *Consequences (recommended)*, *Hardcore* - each sets every option below;
+  tweak from there.
+* Saving & loading rules (work with or without the death rework): manual saves anywhere / only near save stations
+  (recyclers, fabricators, operator dispensers, optionally oxygen stations and roaming operators) / never; a
+  minimum time between manual saves; block quick load (F9) and the pause menu's Load Game (the main menu always
+  works); a timed autosave every X minutes that waits until you are healthy and out of combat. The game's own
+  level-transition autosaves are never blocked.
 * No death menu. After a configurable delay (the death camera plays), the inventory is dropped around the
   death spot as ordinary world items - you can pick them up again, they persist in saves.
 * Respawn at: the entrance you came into the level through (remembered per level), a spawn point you set
@@ -17,10 +24,17 @@ the two can be developed and installed independently. It works fine alongside th
 * Choose what is dropped by category (weapons, ammo, grenades, consumables, neuromods, materials, chipsets,
   plans, keycards/notes, quest items, everything else), what percentage of each stack, and whether the weapon
   in your hands is kept. Plot-critical items are kept unless you say otherwise.
-* After respawn: health percentage, a grace period, suit integrity, an optional wrench in hand, optional
-  degradation damage to your weapons, optional autosave / quicksave, a HUD message, and an experimental
-  map marker on the dropped gear.
-* Everything is a slider or checkbox in the in-game window and an `mc_*` cvar.
+* Destroyed instead of dropped: a share of each dropped category (consumables, ammo, grenades, materials, ...)
+  is simply lost - use it or lose it.
+* After respawn: health percentage, a grace period, suit integrity, a random or fixed trauma (bleeding,
+  concussion, crippled, ...) to treat, an optional wrench in hand, optional degradation damage to your weapons,
+  a save right after the respawn (so the death cannot be undone by loading), a HUD message, and an
+  experimental map marker on the dropped gear.
+* Resources: multipliers for healing (medkits, food, medical operators), suit repair kits, psi hypos, ammo found
+  in the world, ammo dropped by enemies, ammo per fabrication, and consumables found - because a run without
+  reloads burns through more supplies.
+* Everything is a slider or checkbox in the in-game window and an `mc_*` cvar (`mc_save_*` for the save rules,
+  `mc_res_*` for the resource multipliers).
 
 ## Requirements
 
@@ -39,6 +53,11 @@ remembered per-level spawn points) and survive updates.
 
 ## Usage notes
 
+* **Start from a preset.** *Consequences* is the intended experience: dying costs you the walk back plus half
+  your consumables; saving only at stations; no quick load; the game saves after every respawn. Everything is
+  still an individual slider if you want your own mix.
+* The save rules apply during play only; the main menu's Continue / Load always work, so a broken save or a
+  softlock is never a dead end - it just takes a deliberate trip through the main menu.
 * **Level entry** respawn needs you to have entered the level through a door / airlock / elevator once
   while the mod is running; until then the level entrance nearest to where the session started is used.
 * Bind a **spawn key** in the Respawn section to set your own respawn point for the current level.

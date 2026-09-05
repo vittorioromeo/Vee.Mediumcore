@@ -8,6 +8,8 @@
 
 class ArkPlayer;
 class ArkPlayerHealthComponent;
+class ArkGame;
+struct IEntity;
 
 struct MediumcoreSettings
 {
@@ -60,12 +62,62 @@ struct MediumcoreSettings
 
     // After respawn
     int   autosave = 0;             //!< 0 = none, 1 = autosave, 2 = quicksave
+    float autosaveDelay = 2.0f;     //!< seconds after the respawn before that save is written (the player must be alive and settled)
     int   message = 1;              //!< HUD message
     float messageTime = 8.0f;
     int   logItems = 1;             //!< write the dropped items to the log
     int   marker = 0;               //!< put a HUD/map marker on the dropped gear (experimental)
     int   markerPoi = 0;            //!< 0 corpse, 1 debris, 2 workstation, 3 oxygen station
     float markerTime = 0.0f;        //!< seconds until the marker is removed (0 = until the item is gone / picked up)
+
+    // Destroyed instead of dropped: % of the dropped quantity of each category that is simply lost
+    // (stacks are reduced, single items are rolled). "Use it or lose it".
+    float destroyWeapons = 0.0f;
+    float destroyAmmo = 0.0f;
+    float destroyGrenades = 0.0f;
+    float destroyConsumables = 0.0f;
+    float destroyNeuromods = 0.0f;
+    float destroyMaterials = 0.0f;
+    float destroyChipsets = 0.0f;
+    float destroyOther = 0.0f;      //!< plans, keycards/notes, quest items, everything else
+
+    // Trauma after respawn (needs the trauma to exist at the current difficulty settings)
+    int   traumaMode = 0;           //!< 0 none, 1 one random trauma from the enabled list, 2 all enabled traumas
+    int   traumaLevel = 1;          //!< severity level to activate (1 = mild)
+    int   traumaBleeding = 1;
+    int   traumaBurning = 0;
+    int   traumaConcussion = 1;
+    int   traumaCrippled = 1;
+    int   traumaDisruption = 0;
+    int   traumaFear = 0;
+    int   traumaPsychoShock = 0;
+    int   traumaRadiation = 0;
+
+    // Saving & loading rules (independent of 'enabled': they shape the save system on their own)
+    int   saveMode = 0;             //!< 0 game default, 1 manual saves only near a save station, 2 no manual saves at all
+    int   stationRecycler = 1;      //!< what counts as a save station in mode 1
+    int   stationFabricator = 1;
+    int   stationDispenser = 1;     //!< operator dispensers
+    int   stationOxygen = 0;        //!< oxygen refill stations
+    int   stationOperators = 0;     //!< roaming operators (medical / engineering / science / military)
+    float stationRadius = 4.0f;     //!< meters
+    float saveCooldown = 0.0f;      //!< minutes between manual saves (0 = none)
+    int   blockQuickload = 0;       //!< F9 and the pause menu's quick load
+    int   blockLoadMenu = 0;        //!< the pause menu's Load Game (the main menu is never touched)
+    float timedAutosave = 0.0f;     //!< minutes between the mod's own autosaves (0 = off)
+    float timedMinHealth = 50.0f;   //!< no timed autosave below this health %
+    float timedCalmSeconds = 20.0f; //!< ... or within this many seconds after taking damage
+    int   saveMessages = 1;         //!< HUD message when a save/load was blocked
+
+    // Resources: dying (and not reloading) burns through more supplies over a playthrough, so these let
+    // you put some back. All multipliers, 1 = the game's values.
+    float healMult = 1.0f;          //!< healing from medkits, food, drinks and medical operators
+    float suitRepairMult = 1.0f;    //!< suit integrity restored by suit repair kits
+    float psiMult = 1.0f;           //!< psi restored by psi hypos
+    float ammoFoundMult = 1.0f;     //!< ammo found in the world and in containers
+    float ammoLootMult = 1.0f;      //!< ammo dropped by enemies
+    float ammoFabMult = 1.0f;       //!< ammo per fabrication at a fabricator
+    float consumablesFoundMult = 1.0f; //!< medkits, food, patches, hypos found in the world and in containers
 };
 
 //! Per-level remembered positions (saved to Mods/config/Vee.Mediumcore.spawns.xml).
@@ -111,11 +163,24 @@ struct MediumcoreState
 
     float graceTimer = 0.0f;
     float graceHealth = 0.0f;
+    float respawnSaveTimer = 0.0f;  //!< >0: a post-respawn save is due when it reaches 0
+
+    // Save rules
+    float timeSinceManualSave = 1e9f;   //!< seconds
+    float timeSinceAnySave = 0.0f;      //!< seconds (reset by every save, including the game's)
+    float timeSinceDamage = 1e9f;       //!< seconds
+    float lastHealth = -1.0f;
+    float stationDistance = 1e9f;       //!< meters to the nearest save station
+    float stationScanTimer = 0.0f;
+    int   blockedSaves = 0;
+    int   blockedLoads = 0;
+    int   timedSaves = 0;
     float messageTimer = 0.0f;
     std::string message;
     int deaths = 0;
     int lastDroppedCount = 0;
     int lastKeptCount = 0;
+    int lastDestroyedCount = 0;
     std::vector<std::string> lastDropLog;
 };
 
@@ -138,6 +203,31 @@ public:
     void OnLevelTransitionFinished();   //!< hook body (ArkGame::OnLevelTransitionFinished, post)
     void RespawnNow(bool dropItems);     //!< debug: run the respawn sequence immediately
 
+    //! Save rule hook bodies
+    bool AllowManualSave();                         //!< ArkGame::CanManualSave (after the game said yes)
+    void OnQuickSaveAction();                       //!< F5 pressed (before the game handles it)
+    bool AllowSaveLoadMenu(bool bSave);             //!< pause menu Save / Load entries
+    bool AllowQuickLoad();                          //!< F9 / pause menu quick load
+    void OnGameSaved();                             //!< any save completed
+    void OnManualSaveDone();                        //!< a quick/manual save happened
+    bool InAutoSaveCheck() const { return m_inAutoSaveCheck; }
+    void SetInAutoSaveCheck(bool b) { m_inAutoSaveCheck = b; }
+
+    //! Resource hook bodies
+    void SetInPlayerSignal(bool b) { m_inPlayerSignal = b; }
+    bool InPlayerSignal() const { return m_inPlayerSignal; }
+    float ScaleHealthChange(float current, float wanted) const;   //!< ArkPlayerHealthComponent::SetHealth
+    float ScaleStatusReduction(uint64_t signalId, float amount) const; //!< ArkPlayerStatusComponent::ReduceStatus
+    float ScalePsi(float points) const;                           //!< CArkPsiComponent::IncrementPoints
+    void OnItemCountInitialized(struct CArkItem* pItem);          //!< CArkItem::InitializeCount (world pickups, containers)
+    void OnFabricatorSpawnedItem(IEntity* pEnt);                  //!< ArkFabricator::SpawnItem
+    int ScaleLootCount(struct IEntityArchetype* pArchetype, int count) const; //!< CArkItem::GetFabricationCount (enemy loot)
+
+    void ApplyPreset(int preset);
+    static const char* PresetName(int preset);
+    static const char* PresetDescription(int preset);
+    static constexpr int kPresetCount = 4;
+
     MediumcoreSettings& Settings() { return m_s; }
     bool HookInstalled() const { return m_hookInstalled; }
     const char* KeyName(int keyId) const;
@@ -146,7 +236,21 @@ private:
     MediumcoreSettings m_s;
     MediumcoreState m_st;
     bool m_hookInstalled = false;
+    bool m_saveHooksInstalled = false;
     bool m_waitingForKey = false;
+    bool m_inAutoSaveCheck = false;   //!< the game is asking CanManualSave on behalf of an autosave
+    bool m_inPlayerSignal = false;    //!< inside ArkPlayerSignalReceiver::OnReceiveSignal (consumable / operator effects)
+    int m_scaledPickups = 0, m_scaledLoot = 0, m_scaledFab = 0; //!< statistics for the UI
+    unsigned m_lastScaledEntity = 0; int m_lastScaledBefore = 0; //!< to undo a pickup scaling when the same entity turns out to be fabricated
+    bool m_modSaving = false;         //!< we are saving ourselves (respawn / timed autosave)
+    void ModAutoSave(bool immediate);
+    void UpdateSaveRules(float dt, ArkPlayer* pPlayer);
+    void ScanStations();
+    bool NearSaveStation() const { return m_st.stationDistance <= m_s.stationRadius; }
+    const char* SaveBlockReason() const;  //!< nullptr when manual saves are allowed right now
+    std::vector<Vec3> m_stations;         //!< static save stations of the current level
+    std::string m_stationsLevel;
+    void ApplyTrauma(ArkPlayer* pPlayer);
 
     void DoRespawn(ArkPlayer* pPlayer, ArkPlayerHealthComponent* pHealth, bool dropItems);
     int DropInventory(ArkPlayer* pPlayer, const Vec3& at);

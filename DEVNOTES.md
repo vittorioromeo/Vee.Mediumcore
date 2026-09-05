@@ -24,6 +24,43 @@ All offsets are RVAs into that DLL. Read alongside `Src/Mediumcore.cpp`.
   0 = 100 %. POI markers: `ArkPOIComponent::AddMarker(entityId, poiId, min, max)`, ids from
   `Ark/Campaign/POILibrary.xml`.
 
+## Save gating
+
+* `ArkGame::CanManualSave()` (`+0x116CB40`, static) is the game's single gate for quicksaves (F5 goes through
+  `ArkPlayerInput::OnActionQuickSave` `+0x15638A0`, which checks it before `ArkGame::QuickSave`) and for the pause
+  menu's Save entry. It already knows a hidden "ironman" difficulty option (`ArkDifficultyComponent::m_difficultyOptions[0]`,
+  which blocks manual saves unless `m_bPerformingIronmanSave`) and a level property `AllowSaveGameToken`.
+* `ArkGame::CanAutoSave()` (`+0x116CA90`) checks `g_blockAutoSave` and then calls `CanManualSave()` - so a hook on
+  the latter must let autosave checks through (the mod sets a flag around the `CanAutoSave` call).
+* Quick load: `ArkPlayerInput::OnActionLoadLastSave` (`+0x1563460`) and the pause menu both end in
+  `ArkGame::LoadLastSave(listener)` (`+0x116EB30`); returning `eLGR_NoSavesExist` (7) is the quiet failure.
+* Pause menu Save / Load screens open through `ArkPauseMenu::OpenSaveLoadMenu(bool bSave)` (`+0x1370300`).
+* `ArkGame::OnSaveGame()` (`+0x116F4B0`) runs after any save; `QuickSave` (`+0x116FBE0`) / `ManualSave`
+  (`+0x116EE20`) are the manual ones (both create rolling saves).
+* Save stations are ordinary entities: classes `ArkRecycler`, `ArkFabricator`, `ArkOperatorDispenser`,
+  `ArkOxygenRefillStation`; roaming operators are `ArkOperatorMedic/Engineer/Science/Military`.
+
+## Traumas and item destruction
+
+* `ArkPlayerStatusComponent::GetTraumaForStatus(EArkPlayerStatus)` gives an `ArkTraumaBase`; `IsEnabled()` is false
+  for traumas switched off by the difficulty options; `Activate(level)` starts it.
+* Destroying inventory: `IArkItem::ResetCount(n)` shrinks a stack; a whole item goes with
+  `CArkItem::RemoveFromInventory()` + `RemoveEntity()`.
+
+## Resource multipliers
+
+* Consumable and operator effects reach the player as signals: `ArkPlayerSignalReceiver::OnReceiveSignal`
+  (`+0x1575690`) walks the signal's effects - damage / heal both end in `ArkPlayerHealthComponent::SetHealth`
+  (`+0x155EFE0`), psi in `CArkPsiComponent::IncrementPoints` (`+0x157FFD0`), trauma cures (suit patches included) in
+  `ArkPlayerStatusComponent::ReduceStatus(signalId, amount)` (`+0x14631A0`). The mod flags the duration of
+  `OnReceiveSignal` and scales health increases / suit-trauma reductions / psi gains inside it; the suit trauma is
+  identified by `GetTraumaForStatus(SuitIntegrity)->m_id == signalId`.
+* Item stack sizes at spawn: `CArkItem::InitializeCount` (`+0x10B3600`) reads the archetype / entity properties
+  (fixed count or random min..max) and sets the count - world pickups and container loot go through it.
+  `ArkFabricator::SpawnItem` (`+0x1166DE0`) returns the fabricated item entity. `CArkItem::GetFabricationCount`
+  (`+0x10B27E0`), despite the name, is what `ArkNpc::SpawnLootOnDeath` uses for enemy drops.
+  `IArkItem::ResetCount(n)` sets a stack size.
+
 ## Two ABI traps that cost a crash each
 
 1. Member functions returning a struct larger than 8 bytes (`QuatT`, `std::vector`, `std::pair`) take the

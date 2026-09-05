@@ -33,6 +33,11 @@
 #include <Prey/GameDll/arkitem.h>
 #include <Prey/GameDll/ark/ArkItemSystem.h>
 #include <Prey/GameDll/ark/ArkGame.h>
+#include <Prey/GameDll/ark/ui/ArkPauseMenu.h>
+#include <Prey/GameDll/ark/player/ArkPlayerSignalReceiver.h>
+#include <Prey/GameDll/ark/player/ArkPsiComponent.h>
+#include <Prey/GameDll/ark/ArkFabricator.h>
+#include <Prey/GameDll/ark/player/ArkPlayerInput.h>
 #include <Prey/GameDll/ark/iface/IArkItem.h>
 #include <Prey/GameDll/ark/player/ArkPlayerStatusComponent.h>
 #include <Prey/GameDll/ark/player/trauma/ArkTraumaBase.h>
@@ -72,10 +77,156 @@ static void ArkGame_OnLevelTransitionFinished_Hook(ArkGame* const _this)
         gMediumcore->OnLevelTransitionFinished();
 }
 
+//---------------------------------------------------------------------------------
+// Save rule hooks. ArkGame::CanManualSave() is the game's own single gate for quicksaves and the pause
+// menu's Save entry; CanAutoSave() calls it internally, so autosaves are told apart with a flag.
+//---------------------------------------------------------------------------------
+static auto s_hookCanManualSave = ArkGame::FCanManualSave.MakeHook();
+static bool ArkGame_CanManualSave_Hook()
+{
+    if (!s_hookCanManualSave.InvokeOrig())
+        return false;
+    return !gMediumcore || gMediumcore->AllowManualSave();
+}
+
+static auto s_hookCanAutoSave = ArkGame::FCanAutoSave.MakeHook();
+static bool ArkGame_CanAutoSave_Hook()
+{
+    const bool prev = gMediumcore ? gMediumcore->InAutoSaveCheck() : false;
+    if (gMediumcore) gMediumcore->SetInAutoSaveCheck(true);
+    const bool r = s_hookCanAutoSave.InvokeOrig();
+    if (gMediumcore) gMediumcore->SetInAutoSaveCheck(prev);
+    return r;
+}
+
+static auto s_hookLoadLastSave = ArkGame::FLoadLastSave.MakeHook();
+static ELoadGameResult ArkGame_LoadLastSave_Hook(ArkGame* const _this, IArkGameLoadSaveListener* _pListener)
+{
+    if (gMediumcore && !gMediumcore->AllowQuickLoad())
+        return eLGR_NoSavesExist; // the quiet failure code: the game shows nothing, we show our message
+    return s_hookLoadLastSave.InvokeOrig(_this, _pListener);
+}
+
+static auto s_hookOpenSaveLoadMenu = ArkPauseMenu::FOpenSaveLoadMenu.MakeHook();
+static void ArkPauseMenu_OpenSaveLoadMenu_Hook(ArkPauseMenu* const _this, bool _bSave)
+{
+    if (gMediumcore && !gMediumcore->AllowSaveLoadMenu(_bSave))
+        return;
+    s_hookOpenSaveLoadMenu.InvokeOrig(_this, _bSave);
+}
+
+static auto s_hookOnActionQuickSave = ArkPlayerInput::FOnActionQuickSave.MakeHook();
+static bool ArkPlayerInput_OnActionQuickSave_Hook(ArkPlayerInput* const _this, unsigned _entityId, const CCryName& _actionId, int _activationMode, float _value)
+{
+    if (gMediumcore && (_activationMode & eAAM_OnPress))
+        gMediumcore->OnQuickSaveAction();
+    return s_hookOnActionQuickSave.InvokeOrig(_this, _entityId, _actionId, _activationMode, _value);
+}
+
+static auto s_hookQuickSave = ArkGame::FQuickSave.MakeHook();
+static void ArkGame_QuickSave_Hook(ArkGame* const _this)
+{
+    s_hookQuickSave.InvokeOrig(_this);
+    if (gMediumcore) gMediumcore->OnManualSaveDone();
+}
+
+static auto s_hookManualSave = ArkGame::FManualSave.MakeHook();
+static bool ArkGame_ManualSave_Hook(ArkGame* const _this)
+{
+    const bool r = s_hookManualSave.InvokeOrig(_this);
+    if (r && gMediumcore) gMediumcore->OnManualSaveDone();
+    return r;
+}
+
+static auto s_hookOnSaveGame = ArkGame::FOnSaveGame.MakeHook();
+static void ArkGame_OnSaveGame_Hook(ArkGame* const _this)
+{
+    s_hookOnSaveGame.InvokeOrig(_this);
+    if (gMediumcore) gMediumcore->OnGameSaved();
+}
+
+//---------------------------------------------------------------------------------
+// Resource hooks
+//---------------------------------------------------------------------------------
+static auto s_hookOnReceiveSignal = ArkPlayerSignalReceiver::FOnReceiveSignal.MakeHook();
+static void ArkPlayerSignalReceiver_OnReceiveSignal_Hook(ArkPlayerSignalReceiver* const _this, const ArkSignalSystem::Package& _package)
+{
+    const bool prev = gMediumcore ? gMediumcore->InPlayerSignal() : false;
+    if (gMediumcore) gMediumcore->SetInPlayerSignal(true);
+    s_hookOnReceiveSignal.InvokeOrig(_this, _package);
+    if (gMediumcore) gMediumcore->SetInPlayerSignal(prev);
+}
+
+static auto s_hookSetHealth = ArkPlayerHealthComponent::FSetHealth.MakeHook();
+static void ArkPlayerHealthComponent_SetHealth_Hook(ArkPlayerHealthComponent* const _this, const float _health, const bool _bDamagedByRecyclerGrenade)
+{
+    float h = _health;
+    if (gMediumcore && gMediumcore->InPlayerSignal())
+        h = gMediumcore->ScaleHealthChange(_this->GetHealth(), _health);
+    s_hookSetHealth.InvokeOrig(_this, h, _bDamagedByRecyclerGrenade);
+}
+
+static auto s_hookReduceStatus = ArkPlayerStatusComponent::FReduceStatus.MakeHook();
+static void ArkPlayerStatusComponent_ReduceStatus_Hook(ArkPlayerStatusComponent* const _this, uint64_t _signalId, float _amount)
+{
+    float a = _amount;
+    if (gMediumcore && gMediumcore->InPlayerSignal())
+        a = gMediumcore->ScaleStatusReduction(_signalId, _amount);
+    s_hookReduceStatus.InvokeOrig(_this, _signalId, a);
+}
+
+static auto s_hookIncrementPoints = CArkPsiComponent::FIncrementPoints.MakeHook();
+static void CArkPsiComponent_IncrementPoints_Hook(CArkPsiComponent* const _this, const float _points)
+{
+    float p = _points;
+    if (gMediumcore && gMediumcore->InPlayerSignal())
+        p = gMediumcore->ScalePsi(_points);
+    s_hookIncrementPoints.InvokeOrig(_this, p);
+}
+
+static auto s_hookInitializeCount = CArkItem::FInitializeCount.MakeHook();
+static void CArkItem_InitializeCount_Hook(CArkItem* const _this)
+{
+    s_hookInitializeCount.InvokeOrig(_this);
+    if (gMediumcore)
+        gMediumcore->OnItemCountInitialized(_this);
+}
+
+static auto s_hookFabSpawnItem = ArkFabricator::FSpawnItem.MakeHook();
+static IEntity* ArkFabricator_SpawnItem_Hook(ArkFabricator* const _this)
+{
+    IEntity* pEnt = s_hookFabSpawnItem.InvokeOrig(_this);
+    if (gMediumcore && pEnt)
+        gMediumcore->OnFabricatorSpawnedItem(pEnt);
+    return pEnt;
+}
+
+static auto s_hookFabricationCount = CArkItem::FGetFabricationCount.MakeHook();
+static int CArkItem_GetFabricationCount_Hook(IEntityArchetype* const _pArchetype)
+{
+    const int n = s_hookFabricationCount.InvokeOrig(_pArchetype);
+    return gMediumcore ? gMediumcore->ScaleLootCount(_pArchetype, n) : n;
+}
+
 void MediumcoreDeath::InitHooks()
 {
+    s_hookOnReceiveSignal.SetHookFunc(&ArkPlayerSignalReceiver_OnReceiveSignal_Hook);
+    s_hookSetHealth.SetHookFunc(&ArkPlayerHealthComponent_SetHealth_Hook);
+    s_hookReduceStatus.SetHookFunc(&ArkPlayerStatusComponent_ReduceStatus_Hook);
+    s_hookIncrementPoints.SetHookFunc(&CArkPsiComponent_IncrementPoints_Hook);
+    s_hookInitializeCount.SetHookFunc(&CArkItem_InitializeCount_Hook);
+    s_hookFabSpawnItem.SetHookFunc(&ArkFabricator_SpawnItem_Hook);
+    s_hookFabricationCount.SetHookFunc(&CArkItem_GetFabricationCount_Hook);
     s_hookHealthUpdate.SetHookFunc(&ArkPlayerHealthComponent_Update_Hook);
     s_hookTransitionFinished.SetHookFunc(&ArkGame_OnLevelTransitionFinished_Hook);
+    s_hookCanManualSave.SetHookFunc(&ArkGame_CanManualSave_Hook);
+    s_hookCanAutoSave.SetHookFunc(&ArkGame_CanAutoSave_Hook);
+    s_hookLoadLastSave.SetHookFunc(&ArkGame_LoadLastSave_Hook);
+    s_hookOpenSaveLoadMenu.SetHookFunc(&ArkPauseMenu_OpenSaveLoadMenu_Hook);
+    s_hookOnActionQuickSave.SetHookFunc(&ArkPlayerInput_OnActionQuickSave_Hook);
+    s_hookQuickSave.SetHookFunc(&ArkGame_QuickSave_Hook);
+    s_hookManualSave.SetHookFunc(&ArkGame_ManualSave_Hook);
+    s_hookOnSaveGame.SetHookFunc(&ArkGame_OnSaveGame_Hook);
 }
 
 //---------------------------------------------------------------------------------
@@ -85,6 +236,7 @@ void MediumcoreDeath::RegisterCVars()
 {
     MediumcoreSettings& s = m_s;
     m_hookInstalled = s_hookHealthUpdate.IsHooked();
+    m_saveHooksInstalled = s_hookCanManualSave.IsHooked() && s_hookCanAutoSave.IsHooked() && s_hookLoadLastSave.IsHooked() && s_hookOpenSaveLoadMenu.IsHooked();
     REGISTER_CVAR2("mc_enabled", &s.enabled, s.enabled, VF_DUMPTOCHAIR, "Mediumcore: dying drops your inventory and respawns you instead of the death menu (0/1)");
     REGISTER_CVAR2("mc_delay", &s.delay, s.delay, VF_DUMPTOCHAIR, "Mediumcore: seconds between dying and respawning");
     REGISTER_CVAR2("mc_respawn_mode", &s.respawnMode, s.respawnMode, VF_DUMPTOCHAIR, "Mediumcore: respawn at 0 = level entry (remembered per level), 1 = your spawn point (per level; falls back to 0), 2 = level entrance nearest to the death spot, 3 = where this session loaded you, 4 = where you died");
@@ -120,9 +272,53 @@ void MediumcoreDeath::RegisterCVars()
     REGISTER_CVAR2("mc_drop_scatter", &s.scatterRadius, s.scatterRadius, VF_DUMPTOCHAIR, "Mediumcore: scatter radius around the death spot in meters");
     REGISTER_CVAR2("mc_drop_height", &s.dropHeight, s.dropHeight, VF_DUMPTOCHAIR, "Mediumcore: drop height above the death spot in meters");
     REGISTER_CVAR2("mc_autosave", &s.autosave, s.autosave, VF_DUMPTOCHAIR, "Mediumcore: save after respawning. 0 = no, 1 = autosave, 2 = quicksave");
+    REGISTER_CVAR2("mc_autosave_delay", &s.autosaveDelay, s.autosaveDelay, VF_DUMPTOCHAIR, "Mediumcore: seconds after the respawn before that save is written");
     REGISTER_CVAR2("mc_message", &s.message, s.message, VF_DUMPTOCHAIR, "Mediumcore: show a HUD message after respawning (0/1)");
     REGISTER_CVAR2("mc_message_time", &s.messageTime, s.messageTime, VF_DUMPTOCHAIR, "Mediumcore: HUD message duration in seconds");
     REGISTER_CVAR2("mc_log_items", &s.logItems, s.logItems, VF_DUMPTOCHAIR, "Mediumcore: log every dropped item (0/1)");
+    // destroyed instead of dropped
+    REGISTER_CVAR2("mc_destroy_weapons", &s.destroyWeapons, s.destroyWeapons, VF_DUMPTOCHAIR, "Mediumcore: % of dropped weapons that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_ammo", &s.destroyAmmo, s.destroyAmmo, VF_DUMPTOCHAIR, "Mediumcore: % of dropped ammo that is destroyed instead");
+    REGISTER_CVAR2("mc_destroy_grenades", &s.destroyGrenades, s.destroyGrenades, VF_DUMPTOCHAIR, "Mediumcore: % of dropped grenades that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_consumables", &s.destroyConsumables, s.destroyConsumables, VF_DUMPTOCHAIR, "Mediumcore: % of dropped consumables (food, medkits, patches, oxygen) that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_neuromods", &s.destroyNeuromods, s.destroyNeuromods, VF_DUMPTOCHAIR, "Mediumcore: % of dropped neuromods that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_materials", &s.destroyMaterials, s.destroyMaterials, VF_DUMPTOCHAIR, "Mediumcore: % of dropped materials / junk that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_chipsets", &s.destroyChipsets, s.destroyChipsets, VF_DUMPTOCHAIR, "Mediumcore: % of dropped chipsets that are destroyed instead");
+    REGISTER_CVAR2("mc_destroy_other", &s.destroyOther, s.destroyOther, VF_DUMPTOCHAIR, "Mediumcore: % of other dropped items (plans, notes, quest items...) that are destroyed instead");
+    // trauma
+    REGISTER_CVAR2("mc_trauma_mode", &s.traumaMode, s.traumaMode, VF_DUMPTOCHAIR, "Mediumcore: trauma after respawn. 0 none, 1 one random from the enabled list, 2 all enabled");
+    REGISTER_CVAR2("mc_trauma_level", &s.traumaLevel, s.traumaLevel, VF_DUMPTOCHAIR, "Mediumcore: trauma severity level (1 mild .. 3)");
+    REGISTER_CVAR2("mc_trauma_bleeding", &s.traumaBleeding, s.traumaBleeding, VF_DUMPTOCHAIR, "Mediumcore: bleeding is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_burning", &s.traumaBurning, s.traumaBurning, VF_DUMPTOCHAIR, "Mediumcore: burns are a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_concussion", &s.traumaConcussion, s.traumaConcussion, VF_DUMPTOCHAIR, "Mediumcore: concussion is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_crippled", &s.traumaCrippled, s.traumaCrippled, VF_DUMPTOCHAIR, "Mediumcore: crippled leg is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_disruption", &s.traumaDisruption, s.traumaDisruption, VF_DUMPTOCHAIR, "Mediumcore: disruption is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_fear", &s.traumaFear, s.traumaFear, VF_DUMPTOCHAIR, "Mediumcore: fear is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_psychoshock", &s.traumaPsychoShock, s.traumaPsychoShock, VF_DUMPTOCHAIR, "Mediumcore: psychoshock is a possible respawn trauma (0/1)");
+    REGISTER_CVAR2("mc_trauma_radiation", &s.traumaRadiation, s.traumaRadiation, VF_DUMPTOCHAIR, "Mediumcore: radiation is a possible respawn trauma (0/1)");
+    // saving & loading
+    REGISTER_CVAR2("mc_save_mode", &s.saveMode, s.saveMode, VF_DUMPTOCHAIR, "Save rules: 0 game default, 1 manual saves only near a save station, 2 no manual saves (autosaves only)");
+    REGISTER_CVAR2("mc_save_station_recycler", &s.stationRecycler, s.stationRecycler, VF_DUMPTOCHAIR, "Save rules: recyclers are save stations (0/1)");
+    REGISTER_CVAR2("mc_save_station_fabricator", &s.stationFabricator, s.stationFabricator, VF_DUMPTOCHAIR, "Save rules: fabricators are save stations (0/1)");
+    REGISTER_CVAR2("mc_save_station_dispenser", &s.stationDispenser, s.stationDispenser, VF_DUMPTOCHAIR, "Save rules: operator dispensers are save stations (0/1)");
+    REGISTER_CVAR2("mc_save_station_oxygen", &s.stationOxygen, s.stationOxygen, VF_DUMPTOCHAIR, "Save rules: oxygen refill stations are save stations (0/1)");
+    REGISTER_CVAR2("mc_save_station_operators", &s.stationOperators, s.stationOperators, VF_DUMPTOCHAIR, "Save rules: roaming operators are save stations (0/1)");
+    REGISTER_CVAR2("mc_save_station_radius", &s.stationRadius, s.stationRadius, VF_DUMPTOCHAIR, "Save rules: how close to a save station you must be, meters");
+    REGISTER_CVAR2("mc_save_cooldown", &s.saveCooldown, s.saveCooldown, VF_DUMPTOCHAIR, "Save rules: minutes between manual saves (0 = none)");
+    REGISTER_CVAR2("mc_save_block_quickload", &s.blockQuickload, s.blockQuickload, VF_DUMPTOCHAIR, "Save rules: block quick load (F9 and the pause menu entry) (0/1)");
+    REGISTER_CVAR2("mc_save_block_load_menu", &s.blockLoadMenu, s.blockLoadMenu, VF_DUMPTOCHAIR, "Save rules: block the pause menu's Load Game (the main menu still works) (0/1)");
+    REGISTER_CVAR2("mc_save_timed", &s.timedAutosave, s.timedAutosave, VF_DUMPTOCHAIR, "Save rules: minutes between the mod's own autosaves (0 = off)");
+    REGISTER_CVAR2("mc_save_timed_min_health", &s.timedMinHealth, s.timedMinHealth, VF_DUMPTOCHAIR, "Save rules: no timed autosave below this health %");
+    REGISTER_CVAR2("mc_save_timed_calm", &s.timedCalmSeconds, s.timedCalmSeconds, VF_DUMPTOCHAIR, "Save rules: no timed autosave within this many seconds after taking damage");
+    REGISTER_CVAR2("mc_save_messages", &s.saveMessages, s.saveMessages, VF_DUMPTOCHAIR, "Save rules: HUD message when a save or load was blocked (0/1)");
+    // resources
+    REGISTER_CVAR2("mc_res_heal", &s.healMult, s.healMult, VF_DUMPTOCHAIR, "Resources: multiplier for healing from medkits, food, drinks and medical operators");
+    REGISTER_CVAR2("mc_res_suit_repair", &s.suitRepairMult, s.suitRepairMult, VF_DUMPTOCHAIR, "Resources: multiplier for suit integrity restored by suit repair kits");
+    REGISTER_CVAR2("mc_res_psi", &s.psiMult, s.psiMult, VF_DUMPTOCHAIR, "Resources: multiplier for psi restored by psi hypos");
+    REGISTER_CVAR2("mc_res_ammo_found", &s.ammoFoundMult, s.ammoFoundMult, VF_DUMPTOCHAIR, "Resources: multiplier for ammo found in the world and in containers");
+    REGISTER_CVAR2("mc_res_ammo_loot", &s.ammoLootMult, s.ammoLootMult, VF_DUMPTOCHAIR, "Resources: multiplier for ammo dropped by enemies");
+    REGISTER_CVAR2("mc_res_ammo_fab", &s.ammoFabMult, s.ammoFabMult, VF_DUMPTOCHAIR, "Resources: multiplier for ammo per fabrication");
+    REGISTER_CVAR2("mc_res_consumables_found", &s.consumablesFoundMult, s.consumablesFoundMult, VF_DUMPTOCHAIR, "Resources: multiplier for consumables (medkits, food, patches, hypos) found in the world and in containers");
 }
 
 //---------------------------------------------------------------------------------
@@ -296,6 +492,213 @@ void MediumcoreDeath::OnLevelTransitionFinished()
 }
 
 //---------------------------------------------------------------------------------
+// Save rules
+//---------------------------------------------------------------------------------
+static bool IsStaticStationClass(const MediumcoreSettings& s, const char* cls)
+{
+    if (!cls) return false;
+    if (s.stationRecycler && strcmp(cls, "ArkRecycler") == 0) return true;
+    if (s.stationFabricator && strcmp(cls, "ArkFabricator") == 0) return true;
+    if (s.stationDispenser && strcmp(cls, "ArkOperatorDispenser") == 0) return true;
+    if (s.stationOxygen && strcmp(cls, "ArkOxygenRefillStation") == 0) return true;
+    return false;
+}
+
+static bool IsRoamingOperatorClass(const char* cls)
+{
+    return cls && StartsWith(cls, "ArkOperator") && strcmp(cls, "ArkOperatorDispenser") != 0;
+}
+
+void MediumcoreDeath::ScanStations()
+{
+    m_stations.clear();
+    m_stationsLevel = m_st.levelName;
+    if (!gEnv || !gEnv->pEntitySystem)
+        return;
+    IEntityItPtr it = gEnv->pEntitySystem->GetEntityIterator();
+    if (!it)
+        return;
+    it->MoveFirst();
+    while (IEntity* pEnt = it->Next())
+    {
+        const char* cls = pEnt->GetClass() ? pEnt->GetClass()->GetName() : nullptr;
+        if (IsStaticStationClass(m_s, cls))
+            m_stations.push_back(pEnt->GetWorldPos());
+    }
+    CryLog("Mediumcore: found {} save station(s) in '{}'", m_stations.size(), m_st.levelName);
+}
+
+void MediumcoreDeath::UpdateSaveRules(float dt, ArkPlayer* pPlayer)
+{
+    MediumcoreState& st = m_st;
+    st.timeSinceManualSave += dt;
+    st.timeSinceAnySave += dt;
+    st.timeSinceDamage += dt;
+
+    IEntity* pEnt = pPlayer ? pPlayer->GetEntity() : nullptr;
+    ArkPlayerHealthComponent* pHealth = GetHealth(pPlayer);
+    if (!pEnt || !pHealth)
+    {
+        st.lastHealth = -1.0f;
+        st.stationDistance = 1e9f;
+        return;
+    }
+
+    // Damage tracking (for the "calm" condition of timed autosaves)
+    const float h = pHealth->GetHealth();
+    if (st.lastHealth >= 0.0f && h < st.lastHealth - 0.01f)
+        st.timeSinceDamage = 0.0f;
+    st.lastHealth = h;
+
+    // Nearest save station (static list per level + optional live scan for roaming operators)
+    st.stationScanTimer -= dt;
+    if (m_s.saveMode == 1 && st.stationScanTimer <= 0.0f)
+    {
+        st.stationScanTimer = 0.5f;
+        if (m_stationsLevel != st.levelName)
+            ScanStations();
+        const Vec3 me = pEnt->GetWorldPos();
+        float best = 1e9f;
+        for (const Vec3& p : m_stations)
+            best = min(best, (p - me).GetLength());
+        if (m_s.stationOperators && gEnv && gEnv->pEntitySystem)
+        {
+            IEntityItPtr it = gEnv->pEntitySystem->GetEntityIterator();
+            if (it)
+            {
+                it->MoveFirst();
+                while (IEntity* pE = it->Next())
+                {
+                    const char* cls = pE->GetClass() ? pE->GetClass()->GetName() : nullptr;
+                    if (IsRoamingOperatorClass(cls) && !pE->IsHidden())
+                        best = min(best, (pE->GetWorldPos() - me).GetLength());
+                }
+            }
+        }
+        st.stationDistance = best;
+    }
+
+    // Timed autosave
+    if (m_s.timedAutosave > 0.0f && !st.pendingDeath && !pHealth->IsDead() && st.graceTimer <= 0.0f)
+    {
+        const float interval = m_s.timedAutosave * 60.0f;
+        if (st.timeSinceAnySave >= interval)
+        {
+            const float pct = pHealth->GetMaxHealth() > 0.0f ? 100.0f * h / pHealth->GetMaxHealth() : 100.0f;
+            const bool calm = st.timeSinceDamage >= m_s.timedCalmSeconds;
+            if (pct >= m_s.timedMinHealth && calm && !pPlayer->m_bInTrackview)
+            {
+                if (ArkGame::GetArkGame())
+                {
+                    CryLog("Mediumcore: timed autosave ({:.0f} s since the last save)", st.timeSinceAnySave);
+                    ModAutoSave(false);
+                    st.timeSinceAnySave = 0.0f; // even if the game refused (e.g. mid-transition): try again in a while, not every frame
+                    st.timedSaves++;
+                }
+            }
+        }
+    }
+}
+
+void MediumcoreDeath::ModAutoSave(bool immediate)
+{
+    ArkGame* pGame = ArkGame::GetArkGame();
+    if (!pGame)
+        return;
+    m_modSaving = true;
+    pGame->AutoSave(immediate);
+    m_modSaving = false;
+}
+
+const char* MediumcoreDeath::SaveBlockReason() const
+{
+    if (m_s.saveMode == 2)
+        return "Manual saving is disabled - the game saves at level transitions and after deaths.";
+    if (m_s.saveMode == 1 && !NearSaveStation())
+        return "You can only save next to a save station.";
+    if (m_s.saveCooldown > 0.0f && m_st.timeSinceManualSave < m_s.saveCooldown * 60.0f)
+        return "Saved too recently.";
+    return nullptr;
+}
+
+bool MediumcoreDeath::AllowManualSave()
+{
+    if (m_inAutoSaveCheck || m_modSaving)
+        return true; // autosaves (the game's and ours) are never restricted here
+    return SaveBlockReason() == nullptr;
+}
+
+void MediumcoreDeath::OnQuickSaveAction()
+{
+    if (const char* why = SaveBlockReason())
+    {
+        m_st.blockedSaves++;
+        if (m_s.saveMessages)
+        {
+            std::string msg = why;
+            if (m_s.saveMode == 1 && !NearSaveStation() && m_st.stationDistance < 1e8f)
+            {
+                char buf[96];
+                snprintf(buf, sizeof(buf), " Nearest station: %.0f m.", m_st.stationDistance);
+                msg += buf;
+            }
+            else if (m_s.saveCooldown > 0.0f && m_st.timeSinceManualSave < m_s.saveCooldown * 60.0f && m_s.saveMode != 2)
+            {
+                char buf[96];
+                snprintf(buf, sizeof(buf), " Next save in %.0f s.", m_s.saveCooldown * 60.0f - m_st.timeSinceManualSave);
+                msg += buf;
+            }
+            ShowMessage(msg);
+        }
+    }
+}
+
+bool MediumcoreDeath::AllowSaveLoadMenu(bool bSave)
+{
+    if (bSave)
+    {
+        if (const char* why = SaveBlockReason())
+        {
+            m_st.blockedSaves++;
+            if (m_s.saveMessages)
+                ShowMessage(why);
+            return false;
+        }
+        return true;
+    }
+    if (m_s.blockLoadMenu && ArkPlayer::GetInstancePtr())
+    {
+        m_st.blockedLoads++;
+        if (m_s.saveMessages)
+            ShowMessage("Loading is disabled during play. Quit to the main menu if you really need to load a save.");
+        return false;
+    }
+    return true;
+}
+
+bool MediumcoreDeath::AllowQuickLoad()
+{
+    // Only while playing: the main menu's Continue must keep working whatever the rules say.
+    if (!m_s.blockQuickload || !ArkPlayer::GetInstancePtr())
+        return true;
+    m_st.blockedLoads++;
+    if (m_s.saveMessages)
+        ShowMessage("Quick load is disabled. Live with it - or quit to the main menu to load a save.");
+    return false;
+}
+
+void MediumcoreDeath::OnGameSaved()
+{
+    m_st.timeSinceAnySave = 0.0f;
+}
+
+void MediumcoreDeath::OnManualSaveDone()
+{
+    m_st.timeSinceManualSave = 0.0f;
+    m_st.timeSinceAnySave = 0.0f;
+}
+
+//---------------------------------------------------------------------------------
 // Per-frame
 //---------------------------------------------------------------------------------
 void MediumcoreDeath::Update(float dt)
@@ -306,10 +709,23 @@ void MediumcoreDeath::Update(float dt)
     if (!m_spawnsLoaded)
         LoadSpawns();
 
+    // A different level than the one we know about (save loaded into another level, level transition):
+    // everything remembered about the current level is stale.
+    if (pEnt && m_st.playerSeen)
+    {
+        const std::string now = CurrentLevelName();
+        if (!now.empty() && now != m_st.levelName && m_st.captureEntryFrames == 0)
+        {
+            CryLog("Mediumcore: level changed '{}' -> '{}'", m_st.levelName, now);
+            m_st.playerSeen = false;
+            m_st.respawnSaveTimer = 0.0f;
+        }
+    }
+
     // Session position: the first frame the player exists after not existing (load, new game, transition).
     if (pEnt)
     {
-        if (!m_st.playerSeen)
+        if (!m_st.playerSeen && pEnt->GetWorldPos().GetLengthSquared() < 5000.0f * 5000.0f) // not while the player is parked far away during a load
         {
             m_st.playerSeen = true;
             m_st.levelName = CurrentLevelName();
@@ -320,8 +736,12 @@ void MediumcoreDeath::Update(float dt)
             m_st.graceTimer = 0.0f;
             m_st.markerEntity = 0;
             ScanSpawnPoints();
+            ScanStations();
+            m_st.timeSinceAnySave = 0.0f; // a load or a transition autosave just happened
+            m_st.timeSinceDamage = 1e9f;
+            m_st.lastHealth = -1.0f;
         }
-        else if (m_spawnPointsLevel != m_st.levelName)
+        else if (m_st.playerSeen && m_spawnPointsLevel != m_st.levelName)
         {
             ScanSpawnPoints();
         }
@@ -376,6 +796,34 @@ void MediumcoreDeath::Update(float dt)
             RemoveMarker();
     }
 
+    // Deferred post-respawn save (see DoRespawn).
+    if (m_st.respawnSaveTimer > 0.0f)
+    {
+        m_st.respawnSaveTimer -= dt;
+        if (m_st.respawnSaveTimer <= 0.0f)
+        {
+            ArkPlayerHealthComponent* pHealth = GetHealth(pPlayer);
+            if (pPlayer && pHealth && !pHealth->IsDead() && !m_st.pendingDeath)
+            {
+                CryLog("Mediumcore: post-respawn save ({})", m_s.autosave == 2 ? "quicksave" : "autosave");
+                if (m_s.autosave == 2)
+                {
+                    if (ArkGame* pGame = ArkGame::GetArkGame())
+                    {
+                        m_modSaving = true;
+                        pGame->QuickSave();
+                        m_modSaving = false;
+                    }
+                }
+                else
+                    ModAutoSave(false);
+                m_st.timeSinceAnySave = 0.0f;
+            }
+            else
+                CryLog("Mediumcore: post-respawn save skipped (player not alive)");
+        }
+    }
+
     // Post-respawn invulnerability: keep the health where it was.
     if (m_st.graceTimer > 0.0f)
     {
@@ -389,6 +837,8 @@ void MediumcoreDeath::Update(float dt)
 
     if (m_st.messageTimer > 0.0f)
         m_st.messageTimer -= dt;
+
+    UpdateSaveRules(dt, pPlayer);
 }
 
 void MediumcoreDeath::DrawHud()
@@ -560,6 +1010,57 @@ void MediumcoreDeath::ApplySuitIntegrity(ArkPlayer* pPlayer)
         pTrauma->ReduceAccumulation(cur - want, true);
     else if (want > cur)
         pTrauma->Accumulate(want - cur);
+}
+
+void MediumcoreDeath::ApplyTrauma(ArkPlayer* pPlayer)
+{
+    if (m_s.traumaMode == 0)
+        return;
+    ArkPlayerStatusComponent& status = pPlayer->m_playerComponent.GetStatusComponent();
+    struct Pick { EArkPlayerStatus st; int on; const char* name; };
+    const Pick picks[] = {
+        { EArkPlayerStatus::Bleeding, m_s.traumaBleeding, "bleeding" },
+        { EArkPlayerStatus::Burning, m_s.traumaBurning, "burning" },
+        { EArkPlayerStatus::Concussion, m_s.traumaConcussion, "concussion" },
+        { EArkPlayerStatus::Crippled, m_s.traumaCrippled, "crippled" },
+        { EArkPlayerStatus::Disruption, m_s.traumaDisruption, "disruption" },
+        { EArkPlayerStatus::Fear, m_s.traumaFear, "fear" },
+        { EArkPlayerStatus::PsychoShock, m_s.traumaPsychoShock, "psychoshock" },
+        { EArkPlayerStatus::Radiation, m_s.traumaRadiation, "radiation" },
+    };
+    std::vector<std::pair<ArkTraumaBase*, const char*>> candidates;
+    for (const Pick& p : picks)
+    {
+        if (!p.on)
+            continue;
+        ArkTraumaBase* pTrauma = status.GetTraumaForStatus(p.st);
+        if (pTrauma && pTrauma->IsEnabled() && !pTrauma->IsSuspended())
+            candidates.push_back({ pTrauma, p.name });
+    }
+    if (candidates.empty())
+    {
+        CryLog("Mediumcore: no enabled trauma to apply (traumas depend on the difficulty options)");
+        return;
+    }
+    const int wantLevel = clamp_tpl(m_s.traumaLevel, 1, 3);
+    auto apply = [&](ArkTraumaBase* pTrauma, const char* name)
+    {
+        int level = wantLevel;
+        while (level > 1 && !pTrauma->CanActivate(level))
+            level--; // the trauma's config may define fewer levels
+        pTrauma->Activate(level);
+        CryLog("Mediumcore: applied trauma '{}' level {}", name, level);
+    };
+    if (m_s.traumaMode == 1)
+    {
+        const auto& c = candidates[cry_random(0, (int)candidates.size() - 1)];
+        apply(c.first, c.second);
+    }
+    else
+    {
+        for (const auto& c : candidates)
+            apply(c.first, c.second);
+    }
 }
 
 void MediumcoreDeath::GiveWrench(ArkPlayer* pPlayer)
@@ -747,11 +1248,28 @@ bool MediumcoreDeath::ShouldDrop(IArkItem* pItem, const char* cls, std::string& 
     return want != 0;
 }
 
+static CArkItem* pArkItemOf(IArkItem* p) { return static_cast<CArkItem*>(p); }
+//! Plot-critical items are never destroyed (dropping them is already opt-in).
+static bool plotCriticalSafe(CArkItem* p) { return p && p->IsPlotCritical(); }
+
+static float DestroyPercentFor(const MediumcoreSettings& s, const std::string& category)
+{
+    if (StartsWith(category.c_str(), "weapon")) return s.destroyWeapons;
+    if (StartsWith(category.c_str(), "ammo")) return s.destroyAmmo;
+    if (StartsWith(category.c_str(), "grenade")) return s.destroyGrenades;
+    if (StartsWith(category.c_str(), "consumable")) return s.destroyConsumables;
+    if (StartsWith(category.c_str(), "neuromod")) return s.destroyNeuromods;
+    if (StartsWith(category.c_str(), "material")) return s.destroyMaterials;
+    if (StartsWith(category.c_str(), "chipset")) return s.destroyChipsets;
+    return s.destroyOther;
+}
+
 int MediumcoreDeath::DropInventory(ArkPlayer* pPlayer, const Vec3& at)
 {
     m_st.lastDropLog.clear();
     m_st.lastDroppedCount = 0;
     m_st.lastKeptCount = 0;
+    m_st.lastDestroyedCount = 0;
     if (!pPlayer || !pPlayer->m_pInventory || !gEnv || !gEnv->pEntitySystem)
         return 0;
     ArkGame* pGame = ArkGame::GetArkGame();
@@ -792,9 +1310,37 @@ int MediumcoreDeath::DropInventory(ArkPlayer* pPlayer, const Vec3& at)
         if (dropCount <= 0)
             drop = false;
 
+        // Destroyed instead of dropped: a share of the dropped quantity is simply lost.
+        int destroyCount = 0;
+        if (drop && !plotCriticalSafe(pArkItemOf(pItem)))
+        {
+            const float dp = clamp_tpl(DestroyPercentFor(m_s, category), 0.0f, 100.0f);
+            if (dp > 0.0f)
+            {
+                if (pItem->IsStackable() && count > 1)
+                {
+                    // Stochastic rounding, so a 50 % setting is 50 % on average for small stacks too.
+                    const float x = dropCount * dp / 100.0f;
+                    destroyCount = clamp_tpl((int)x + ((cry_random(0.0f, 1.0f) < x - (int)x) ? 1 : 0), 0, dropCount);
+                }
+                else
+                    destroyCount = (dp >= 100.0f || cry_random(0.0f, 100.0f) < dp) ? dropCount : 0;
+            }
+            // The weapon in your hands is dropped, never destroyed: the weapon component still refers to it.
+            if (id == equippedId)
+                destroyCount = 0;
+        }
+        const int spawnCount = dropCount - destroyCount;
+
         char line[256];
-        snprintf(line, sizeof(line), "%s %s x%d [%s]%s", drop ? "DROP" : "keep", pEnt->GetName() ? pEnt->GetName() : cls, dropCount, category.c_str(),
-                 (drop && dropCount < count) ? " (partial)" : "");
+        snprintf(line, sizeof(line), "%s %s x%d [%s]%s%s", drop ? (spawnCount > 0 ? "DROP" : "DESTROY") : "keep", pEnt->GetName() ? pEnt->GetName() : cls,
+                 dropCount, category.c_str(), (drop && dropCount < count) ? " (partial)" : "", (drop && destroyCount > 0 && spawnCount > 0) ? " (part destroyed)" : "");
+        if (drop && destroyCount > 0)
+        {
+            char d[48];
+            snprintf(d, sizeof(d), " -%d destroyed", destroyCount);
+            strncat(line, d, sizeof(line) - strlen(line) - 1);
+        }
         m_st.lastDropLog.push_back(line);
         if (m_s.logItems)
             CryLog("Mediumcore: {}", line);
@@ -804,11 +1350,28 @@ int MediumcoreDeath::DropInventory(ArkPlayer* pPlayer, const Vec3& at)
             continue;
         }
 
+        if (destroyCount > 0)
+        {
+            m_st.lastDestroyedCount += destroyCount;
+            if (spawnCount <= 0 && destroyCount >= count)
+            {
+                // Whole item gone.
+                CArkItem* pArk = static_cast<CArkItem*>(pItem);
+                pArk->RemoveFromInventory();
+                pArk->RemoveEntity();
+                continue;
+            }
+            // Shrink the stack first; the remainder of the dropped share is then dropped normally.
+            pItem->ResetCount(count - destroyCount);
+            if (spawnCount <= 0)
+                continue; // the kept part stays in the inventory
+        }
+
         // Scatter in a ring around the death spot (golden-angle spiral so items do not pile up).
         const float a = index * 2.399963f;
         const float r = radius * sqrtf((index + 1.0f) / (ids.size() + 1.0f));
         const Vec3 pos = at + Vec3(cosf(a) * r, sinf(a) * r, m_s.dropHeight + 0.05f * (index % 3));
-        pItem->Drop(dropCount, &pos);
+        pItem->Drop(spawnCount, &pos);
         if (dropped == 0)
             m_st.markerEntity = 0, m_firstDropped = id;
         dropped++;
@@ -868,27 +1431,232 @@ void MediumcoreDeath::DoRespawn(ArkPlayer* pPlayer, ArkPlayerHealthComponent* pH
     m_st.graceHealth = health;
     m_st.graceTimer = max(m_s.gracePeriod, 0.0f);
     ApplySuitIntegrity(pPlayer);
+    ApplyTrauma(pPlayer);
     GiveWrench(pPlayer);
     CryLog("Mediumcore: respawn stage 5 (marker / save / message)");
     if (dropped > 0 && m_s.marker && m_firstDropped)
         PlaceMarker(m_firstDropped);
 
-    if (m_s.autosave == 1)
-        ArkGame::GetArkGame()->AutoSave(true);
-    else if (m_s.autosave == 2)
-        ArkGame::GetArkGame()->QuickSave();
+    // The save is deferred: right now the player has just been teleported and revived, the physics /
+    // movement state is still settling, and a save taken in that state can load with the player flung
+    // away from the level. Update() writes it once the player is alive and steady.
+    if (m_s.autosave != 0)
+        m_st.respawnSaveTimer = max(m_s.autosaveDelay, 0.25f);
 
     CryLog("Mediumcore: respawn done");
     if (m_s.message)
     {
         char buf[256];
         const float dist = (pos - deathPos).GetLength();
-        if (dropped > 0)
+        if (dropped > 0 && m_st.lastDestroyedCount > 0)
+            snprintf(buf, sizeof(buf), "You died. %d item%s dropped where you fell (%.0f m away), %d destroyed. Respawned at %s.", dropped, dropped == 1 ? "" : "s", dist, m_st.lastDestroyedCount, source);
+        else if (dropped > 0)
             snprintf(buf, sizeof(buf), "You died. %d item%s dropped where you fell (%.0f m away). Respawned at %s.", dropped, dropped == 1 ? "" : "s", dist, source);
+        else if (m_st.lastDestroyedCount > 0)
+            snprintf(buf, sizeof(buf), "You died. %d item%s destroyed. Respawned at %s.", m_st.lastDestroyedCount, m_st.lastDestroyedCount == 1 ? "" : "s", source);
         else
             snprintf(buf, sizeof(buf), "You died. Nothing was dropped.");
         ShowMessage(buf);
     }
+}
+
+//---------------------------------------------------------------------------------
+// Resources
+//---------------------------------------------------------------------------------
+//! Scales a stack count with stochastic rounding (1.5 x 1 = 1 or 2, 50/50). Never below 1.
+static int ScaleCount(int n, float mult)
+{
+    if (n <= 0 || fabsf(mult - 1.0f) < 0.001f)
+        return n;
+    const float x = n * clamp_tpl(mult, 0.0f, 10.0f);
+    const int r = (int)x + ((cry_random(0.0f, 1.0f) < x - (int)x) ? 1 : 0);
+    return max(r, 1);
+}
+
+static bool IsAmmoClass(const char* cls) { return StartsWith(cls, "ArkAmmo"); }
+static bool IsConsumableClass(const char* cls)
+{
+    return StartsWith(cls, "ArkFood") || StartsWith(cls, "ArkAlcohol") || StartsWith(cls, "ArkCure") || StartsWith(cls, "ArkMedKit") ||
+           StartsWith(cls, "ArkSuitPatch") || StartsWith(cls, "ArkOxygen") || StartsWith(cls, "ArkConsumable") || StartsWith(cls, "ArkSuperFood") ||
+           StartsWith(cls, "ArkPsiHypo");
+}
+
+float MediumcoreDeath::ScaleHealthChange(float current, float wanted) const
+{
+    if (wanted <= current || fabsf(m_s.healMult - 1.0f) < 0.001f)
+        return wanted; // damage, or nothing to scale
+    return current + (wanted - current) * clamp_tpl(m_s.healMult, 0.0f, 10.0f);
+}
+
+float MediumcoreDeath::ScaleStatusReduction(uint64_t signalId, float amount) const
+{
+    if (fabsf(m_s.suitRepairMult - 1.0f) < 0.001f)
+        return amount;
+    ArkPlayer* pPlayer = ArkPlayer::GetInstancePtr();
+    if (!pPlayer)
+        return amount;
+    const ArkTraumaBase* pSuit = pPlayer->m_playerComponent.GetStatusComponent().GetTraumaForStatus(EArkPlayerStatus::SuitIntegrity);
+    if (pSuit && pSuit->m_id == signalId)
+        return amount * clamp_tpl(m_s.suitRepairMult, 0.0f, 10.0f);
+    return amount;
+}
+
+float MediumcoreDeath::ScalePsi(float points) const
+{
+    if (points <= 0.0f)
+        return points;
+    return points * clamp_tpl(m_s.psiMult, 0.0f, 10.0f);
+}
+
+void MediumcoreDeath::OnItemCountInitialized(CArkItem* pItem)
+{
+    IEntity* pEnt = pItem ? pItem->GetEntity() : nullptr;
+    if (!pEnt || !pEnt->GetClass())
+        return;
+    const char* cls = pEnt->GetClass()->GetName();
+    float mult = 1.0f;
+    if (IsAmmoClass(cls))
+        mult = m_s.ammoFoundMult;
+    else if (IsConsumableClass(cls))
+        mult = m_s.consumablesFoundMult;
+    if (fabsf(mult - 1.0f) < 0.001f)
+        return;
+    const int before = pItem->GetCount();
+    const int after = ScaleCount(before, mult);
+    if (after != before)
+    {
+        pItem->ResetCount(after);
+        m_scaledPickups++;
+        m_lastScaledEntity = pEnt->GetId();
+        m_lastScaledBefore = before;
+    }
+}
+
+void MediumcoreDeath::OnFabricatorSpawnedItem(IEntity* pEnt)
+{
+    if (fabsf(m_s.ammoFabMult - 1.0f) < 0.001f || !pEnt->GetClass() || !IsAmmoClass(pEnt->GetClass()->GetName()))
+        return;
+    ArkGame* pGame = ArkGame::GetArkGame();
+    if (!pGame)
+        return;
+    IArkItem* pItem = pGame->GetArkItemSystem().GetItem(pEnt->GetId());
+    if (!pItem)
+        return;
+    // The item was just spawned, so the "ammo found" scaling may have been applied to it a moment ago: undo that.
+    int before = pItem->GetCount();
+    if (pEnt->GetId() == m_lastScaledEntity && m_lastScaledEntity != 0)
+    {
+        before = m_lastScaledBefore;
+        m_scaledPickups--;
+        m_lastScaledEntity = 0;
+    }
+    const int after = ScaleCount(before, m_s.ammoFabMult);
+    if (after != pItem->GetCount())
+    {
+        pItem->ResetCount(after);
+        m_scaledFab++;
+        CryLog("Mediumcore: fabricated {} x{} -> x{}", pEnt->GetClass()->GetName(), before, after);
+    }
+}
+
+int MediumcoreDeath::ScaleLootCount(IEntityArchetype* pArchetype, int count) const
+{
+    if (!pArchetype || !pArchetype->GetClass() || fabsf(m_s.ammoLootMult - 1.0f) < 0.001f)
+        return count;
+    if (!IsAmmoClass(pArchetype->GetClass()->GetName()))
+        return count;
+    const int after = ScaleCount(count, m_s.ammoLootMult);
+    if (after != count)
+        const_cast<MediumcoreDeath*>(this)->m_scaledLoot++;
+    return after;
+}
+
+//---------------------------------------------------------------------------------
+// Presets: bundles of the individual settings. Key bindings, message and logging options are left alone.
+//---------------------------------------------------------------------------------
+const char* MediumcoreDeath::PresetName(int preset)
+{
+    switch (preset)
+    {
+    case 0: return "Mediumcore classic";
+    case 1: return "Gentle";
+    case 2: return "Consequences (recommended)";
+    case 3: return "Hardcore";
+    default: return "?";
+    }
+}
+
+const char* MediumcoreDeath::PresetDescription(int preset)
+{
+    switch (preset)
+    {
+    case 0: return "Terraria rules, nothing else: everything is dropped where you died, you respawn at the level entry with full health.\nSaving and loading are untouched (so reloading is still the easy way out).";
+    case 1: return "A taste of consequences: weapons, ammo and grenades are dropped, the game saves right after you respawn and quick load is off,\nbut you can still save anywhere (at most every 5 minutes) and load from the pause menu. Timed autosave every 5 minutes.";
+    case 2: return "Death is final but fair: gear is dropped, half of your consumables and a quarter of your ammo are destroyed, you come back\nat 40% health with a suit at 50%, a random mild trauma, a wrench in hand and 15 points of wear on your weapons. Healing and suit repairs are 1.5x, ammo 1.25x. Manual saves only at recyclers, fabricators and operator dispensers;\nno quick load, no loading from the pause menu; the game saves after every respawn and every 10 quiet minutes.";
+    case 3: return "No manual saves at all - only level transitions, respawns and a timed autosave every 15 minutes. All consumables and half\nof your ammo, grenades and materials are destroyed on death; you respawn at 25% health, suit at 25%, with every enabled trauma.\nTo compensate: healing and suit repairs 2x, psi hypos 1.5x, ammo 1.5x, consumables found 1.25x.";
+    default: return "";
+    }
+}
+
+void MediumcoreDeath::ApplyPreset(int preset)
+{
+    MediumcoreSettings& s = m_s;
+    const MediumcoreSettings def;
+    // Common base: mediumcore on, default drop set, no destruction, no trauma, vanilla saving.
+    s.enabled = 1;
+    s.delay = def.delay; s.respawnMode = 0; s.spawnHeightOffset = def.spawnHeightOffset;
+    s.healthPercent = 100.0f; s.gracePeriod = 3.0f; s.keepEquippedWeapon = 0; s.suitIntegrity = -1.0f;
+    s.giveWrench = 0; s.equipWrench = 1;
+    s.weaponDamage = 0.0f; s.weaponDamageMode = 0; s.weaponDamageRespectDifficulty = 1; s.weaponDamageKept = 1;
+    s.dropWeapons = 1; s.dropAmmo = 1; s.dropGrenades = 1; s.dropConsumables = 1; s.dropNeuromods = 1; s.dropMaterials = 1; s.dropChipsets = 1;
+    s.dropPlans = 0; s.dropKeycardsNotes = 0; s.dropQuestItems = 0; s.dropOther = 1; s.dropPlotCritical = 0;
+    s.dropPercent = 100.0f; s.scatterRadius = def.scatterRadius; s.dropHeight = def.dropHeight;
+    s.destroyWeapons = s.destroyAmmo = s.destroyGrenades = s.destroyConsumables = s.destroyNeuromods = s.destroyMaterials = s.destroyChipsets = s.destroyOther = 0.0f;
+    s.traumaMode = 0; s.traumaLevel = 1;
+    s.traumaBleeding = 1; s.traumaConcussion = 1; s.traumaCrippled = 1; s.traumaBurning = s.traumaDisruption = s.traumaFear = s.traumaPsychoShock = s.traumaRadiation = 0;
+    s.autosave = 0;
+    s.saveMode = 0; s.stationRecycler = 1; s.stationFabricator = 1; s.stationDispenser = 1; s.stationOxygen = 0; s.stationOperators = 0; s.stationRadius = 4.0f;
+    s.saveCooldown = 0.0f; s.blockQuickload = 0; s.blockLoadMenu = 0; s.timedAutosave = 0.0f; s.timedMinHealth = 50.0f; s.timedCalmSeconds = 20.0f;
+    s.healMult = s.suitRepairMult = s.psiMult = s.ammoFoundMult = s.ammoLootMult = s.ammoFabMult = s.consumablesFoundMult = 1.0f;
+
+    switch (preset)
+    {
+    case 0: // classic
+        break;
+    case 1: // gentle
+        s.dropConsumables = 0; s.dropNeuromods = 0; s.dropMaterials = 0; s.dropChipsets = 0; s.dropOther = 0;
+        s.giveWrench = 1;
+        s.autosave = 1;
+        s.blockQuickload = 1;
+        s.saveCooldown = 5.0f;
+        s.timedAutosave = 5.0f;
+        break;
+    case 2: // consequences
+        s.healthPercent = 40.0f; s.suitIntegrity = 50.0f; s.gracePeriod = 4.0f;
+        s.giveWrench = 1;
+        s.weaponDamage = 15.0f;
+        s.destroyConsumables = 50.0f; s.destroyAmmo = 25.0f;
+        s.traumaMode = 1;
+        s.autosave = 1;
+        s.saveMode = 1; s.blockQuickload = 1; s.blockLoadMenu = 1;
+        s.timedAutosave = 10.0f;
+        s.healMult = 1.5f; s.suitRepairMult = 1.5f; s.ammoFoundMult = 1.25f; s.ammoLootMult = 1.25f; s.ammoFabMult = 1.25f;
+        break;
+    case 3: // hardcore
+        s.healthPercent = 25.0f; s.suitIntegrity = 25.0f; s.gracePeriod = 3.0f;
+        s.giveWrench = 1;
+        s.weaponDamage = 30.0f;
+        s.destroyConsumables = 100.0f; s.destroyAmmo = 50.0f; s.destroyGrenades = 50.0f; s.destroyMaterials = 50.0f;
+        s.traumaMode = 2; s.traumaBurning = 1; s.traumaDisruption = 1; s.traumaFear = 1;
+        s.autosave = 1;
+        s.saveMode = 2; s.blockQuickload = 1; s.blockLoadMenu = 1;
+        s.timedAutosave = 15.0f; s.timedMinHealth = 30.0f;
+        s.healMult = 2.0f; s.suitRepairMult = 2.0f; s.psiMult = 1.5f; s.ammoFoundMult = 1.5f; s.ammoLootMult = 1.5f; s.ammoFabMult = 1.5f; s.consumablesFoundMult = 1.25f;
+        break;
+    default:
+        break;
+    }
+    CryLog("Mediumcore: applied preset '{}'", PresetName(preset));
 }
 
 //---------------------------------------------------------------------------------
@@ -910,6 +1678,59 @@ void MediumcoreDeath::DrawSettings()
     MediumcoreSettings& s = m_s;
     if (!m_hookInstalled)
         ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Warning: the health-update hook is not installed, mediumcore cannot work.");
+
+    if (ImGui::CollapsingHeader("Presets"))
+    {
+        ImGui::TextWrapped("A preset sets every option below at once (except key bindings, messages and logging). Tweak afterwards as you like.");
+        for (int i = 0; i < kPresetCount; ++i)
+        {
+            if (ImGui::Button(PresetName(i)))
+                ApplyPreset(i);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", PresetDescription(i));
+            if (i + 1 < kPresetCount)
+                ImGui::SameLine();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Saving & loading", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        if (!m_saveHooksInstalled)
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Warning: the save hooks are not installed; these rules have no effect.");
+        ImGui::TextWrapped("These rules work on their own, with or without mediumcore death. The game's own autosaves (level transitions) are never blocked, and the main menu is never touched.");
+        const char* modes[] = { "Game default (save anywhere)", "Manual saves only near a save station", "No manual saves (autosaves only)" };
+        ImGui::Combo("Manual saves", &s.saveMode, modes, 3);
+        if (s.saveMode == 1)
+        {
+            ImGui::Indent();
+            ImGui::Text("Save stations:");
+            ImGui::SameLine(); McCheckbox("Recyclers", s.stationRecycler);
+            ImGui::SameLine(); McCheckbox("Fabricators", s.stationFabricator);
+            ImGui::SameLine(); McCheckbox("Operator dispensers", s.stationDispenser);
+            ImGui::SameLine(); McCheckbox("Oxygen stations", s.stationOxygen);
+            ImGui::SameLine(); McCheckbox("Roaming operators", s.stationOperators, "Medical, engineering, science and military operators floating around.");
+            ImGui::SliderFloat("Station radius", &s.stationRadius, 1.0f, 15.0f, "%.1f m");
+            if (m_st.stationDistance < 1e8f)
+                ImGui::TextDisabled("%d station(s) in this level, nearest %.0f m away%s", (int)m_stations.size(), m_st.stationDistance, NearSaveStation() ? " - you can save here" : "");
+            ImGui::Unindent();
+        }
+        if (s.saveMode != 2)
+            ImGui::SliderFloat("Minimum time between manual saves", &s.saveCooldown, 0.0f, 30.0f, s.saveCooldown <= 0.0f ? "none" : "%.0f min");
+        McCheckbox("Block quick load (F9)", s.blockQuickload, "Also the pause menu's quick load entry.");
+        McCheckbox("Block Load Game in the pause menu", s.blockLoadMenu, "Loading then means quitting to the main menu first - deliberate, not a reflex.");
+        ImGui::SliderFloat("Timed autosave", &s.timedAutosave, 0.0f, 30.0f, s.timedAutosave <= 0.0f ? "off" : "every %.0f min");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The mod saves on its own at this interval (counted from the last save of any kind), when things are calm.");
+        if (s.timedAutosave > 0.0f)
+        {
+            ImGui::Indent();
+            ImGui::SliderFloat("... only above", &s.timedMinHealth, 0.0f, 100.0f, "%.0f %% health");
+            ImGui::SliderFloat("... and no damage for", &s.timedCalmSeconds, 0.0f, 120.0f, "%.0f s");
+            ImGui::Unindent();
+        }
+        McCheckbox("HUD message when a save or load is blocked", s.saveMessages);
+        ImGui::TextDisabled("Blocked this session: %d save(s), %d load(s). Timed autosaves: %d. Last save %.0f s ago.", m_st.blockedSaves, m_st.blockedLoads, m_st.timedSaves, m_st.timeSinceAnySave);
+    }
 
     McCheckbox("Enable mediumcore death", s.enabled,
         "When you die: after a short delay your inventory is dropped where you fell and you respawn.\n"
@@ -982,6 +1803,27 @@ void MediumcoreDeath::DrawSettings()
         ImGui::BeginDisabled(!s.giveWrench);
         McCheckbox("and hold it", s.equipWrench);
         ImGui::EndDisabled();
+
+        const char* tm[] = { "None", "One random trauma from the list", "Every trauma in the list" };
+        ImGui::Combo("Trauma after respawn", &s.traumaMode, tm, 3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Treat it with the matching consumable. Only traumas that exist at your difficulty settings can be applied\n(the 'All traumas' difficulty option, or Nightmare, enables all of them).");
+        if (s.traumaMode != 0)
+        {
+            ImGui::Indent();
+            ImGui::SliderInt("Severity", &s.traumaLevel, 1, 3);
+            ImGui::Columns(4, nullptr, false);
+            McCheckbox("Bleeding", s.traumaBleeding); ImGui::NextColumn();
+            McCheckbox("Burning", s.traumaBurning); ImGui::NextColumn();
+            McCheckbox("Concussion", s.traumaConcussion); ImGui::NextColumn();
+            McCheckbox("Crippled", s.traumaCrippled); ImGui::NextColumn();
+            McCheckbox("Disruption", s.traumaDisruption); ImGui::NextColumn();
+            McCheckbox("Fear", s.traumaFear); ImGui::NextColumn();
+            McCheckbox("Psychoshock", s.traumaPsychoShock); ImGui::NextColumn();
+            McCheckbox("Radiation", s.traumaRadiation);
+            ImGui::Columns(1);
+            ImGui::Unindent();
+        }
     }
 
     if (ImGui::CollapsingHeader("Weapon damage on death", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1021,10 +1863,52 @@ void MediumcoreDeath::DrawSettings()
         ImGui::SliderFloat("Drop height", &s.dropHeight, 0.0f, 1.5f, "%.2f m");
     }
 
+    if (ImGui::CollapsingHeader("Destroyed instead of dropped", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::TextWrapped("Share of each dropped category that is simply lost. Holding on to things becomes a risk - use them before something eats you. Stacks are reduced; single items are rolled. Plot-critical items are never destroyed.");
+        auto pct = [](const char* label, float& v) { ImGui::SliderFloat(label, &v, 0.0f, 100.0f, v <= 0.0f ? "none" : "%.0f %%"); };
+        ImGui::Columns(2, nullptr, false);
+        pct("Consumables##d", s.destroyConsumables);
+        pct("Ammo##d", s.destroyAmmo);
+        pct("Grenades##d", s.destroyGrenades);
+        pct("Materials / junk##d", s.destroyMaterials);
+        ImGui::NextColumn();
+        pct("Weapons##d", s.destroyWeapons);
+        pct("Chipsets##d", s.destroyChipsets);
+        pct("Neuromods##d", s.destroyNeuromods);
+        pct("Everything else##d", s.destroyOther);
+        ImGui::Columns(1);
+    }
+
+    ImGui::EndDisabled(); // resources work with or without mediumcore death
+    if (ImGui::CollapsingHeader("Resources & consumables", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::TextWrapped("Dying instead of reloading burns through more supplies over a playthrough; these put some back. 1.00 = the game's values. Apply to items found from now on (not to what you already carry).");
+        auto mult = [](const char* label, float& v, const char* tip) {
+            ImGui::SliderFloat(label, &v, 0.25f, 4.0f, "x%.2f");
+            if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        mult("Healing", s.healMult, "Medkits, food, drinks and medical operators.");
+        mult("Suit repair", s.suitRepairMult, "Suit repair kits.");
+        mult("Psi hypos", s.psiMult, nullptr);
+        mult("Ammo found", s.ammoFoundMult, "Ammo lying around and in containers.");
+        mult("Ammo from enemies", s.ammoLootMult, "Ammo dropped by killed enemies.");
+        mult("Ammo per fabrication", s.ammoFabMult, "How much ammo a fabricator makes per plan use (same materials).");
+        mult("Consumables found", s.consumablesFoundMult, "Medkits, food, suit patches, psi hypos lying around and in containers. Single items: x1.5 means a 50 %% chance of finding two.");
+        ImGui::TextDisabled("This session: %d pickups, %d enemy drops, %d fabrications scaled.", m_scaledPickups, m_scaledLoot, m_scaledFab);
+    }
+    ImGui::BeginDisabled(!s.enabled);
+
     if (ImGui::CollapsingHeader("After respawn", ImGuiTreeNodeFlags_DefaultOpen))
     {
         const char* saves[] = { "Do not save", "Autosave", "Quicksave" };
         ImGui::Combo("Save", &s.autosave, saves, 3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Saving right after the respawn is what makes death stick: loading the last save cannot undo it.\nThis save is never blocked by the saving rules above.");
+        if (s.autosave != 0)
+            ImGui::SliderFloat("... after", &s.autosaveDelay, 0.25f, 10.0f, "%.1f s");
+        if (s.autosave != 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Gives the game a moment to settle the revived player before the save is written.");
         McCheckbox("Show HUD message", s.message);
         ImGui::BeginDisabled(!s.message);
         ImGui::SliderFloat("Message duration", &s.messageTime, 1.0f, 20.0f, "%.0f s");
@@ -1040,7 +1924,7 @@ void MediumcoreDeath::DrawSettings()
 
     if (ImGui::CollapsingHeader("Status / testing"))
     {
-        ImGui::Text("Deaths this session: %d | last respawn: %d dropped, %d kept", m_st.deaths, m_st.lastDroppedCount, m_st.lastKeptCount);
+        ImGui::Text("Deaths this session: %d | last respawn: %d dropped, %d kept, %d destroyed", m_st.deaths, m_st.lastDroppedCount, m_st.lastKeptCount, m_st.lastDestroyedCount);
         ImGui::Text("Level entry point: %s | pending death: %s (%.1f s) | grace: %.1f s", m_st.levelSpawnValid ? "recorded" : "-",
             m_st.pendingDeath ? "yes" : "no", m_st.deathTimer, max(m_st.graceTimer, 0.0f));
         if (m_st.deathValid)
