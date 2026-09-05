@@ -1,0 +1,15 @@
+{
+  "name": "vee-mediumcore",
+  "version-string": "1.0.0",
+  "description": "Prey (2017) Terraria-style mediumcore death: drop your inventory and respawn (Chairloader mod)",
+  "builtin-baseline": "f7423ee180c4b7f40d43402c2feb3859161ef625",
+  "dependencies": [
+    "boost-algorithm",
+    "boost-bimap",
+    "boost-core",
+    "boost-format",
+    "boost-variant",
+    "detours",
+    "fmt"
+  ]
+}
