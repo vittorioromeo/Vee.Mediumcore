@@ -2,6 +2,8 @@
 #include "ModMain.h"
 #include "Mediumcore.h"
 #include <Prey/CrySystem/IConsole.h>
+#include <vector>
+#include <string>
 
 ModMain* gMod = nullptr;
 
@@ -57,8 +59,31 @@ void ModMain::ShutdownGame(bool isHotUnloading)
     BaseClass::ShutdownGame(isHotUnloading);
 }
 
+
+//! Removes every console variable with the given prefix. The console keeps raw pointers to the names, help
+//! strings and value storage we registered - all of which vanish with this DLL - and the engine touches them
+//! again at shutdown (crash on exit) unless they are gone before the module is unloaded.
+static void UnregisterCVarsWithPrefix(const char* prefix)
+{
+    if (!gEnv || !gEnv->pConsole)
+        return;
+    const int total = gEnv->pConsole->GetNumVars(false);
+    if (total <= 0)
+        return;
+    std::vector<const char*> names((size_t)total + 1, nullptr);
+    const size_t n = gEnv->pConsole->GetSortedVars(names.data(), names.size(), prefix);
+    std::vector<std::string> copies;
+    for (size_t i = 0; i < n && i < names.size(); i++)
+        if (names[i])
+            copies.emplace_back(names[i]);
+    for (const std::string& name : copies)
+        gEnv->pConsole->UnregisterVariable(name.c_str(), true);
+    CryLog("Unregistered {} console variable(s) with prefix '{}'", copies.size(), prefix);
+}
+
 void ModMain::ShutdownSystem(bool isHotUnloading)
 {
+    UnregisterCVarsWithPrefix("mc_");
     BaseClass::ShutdownSystem(isHotUnloading);
 }
 
